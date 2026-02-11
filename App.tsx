@@ -1,29 +1,35 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Image,
+  Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View
 } from 'react-native';
-import MapView, { Marker, Polyline } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as ImagePicker from 'expo-image-picker';
 import { createRoute, deleteRoute, fetchRoutes, updateRoute } from './src/services/api';
+import RouteMap from './src/components/RouteMap';
 import { loadRoutesFromStorage, saveRoutesToStorage } from './src/storage/routesStorage';
 import { FitRoute, RoutePoint } from './src/types/route';
 
 export default function App() {
+  const { width } = useWindowDimensions();
   const [routes, setRoutes] = useState<FitRoute[]>([]);
   const [loading, setLoading] = useState(false);
   const [name, setName] = useState('');
   const [points, setPoints] = useState<RoutePoint[]>([]);
   const [photoUri, setPhotoUri] = useState<string | undefined>(undefined);
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  const isWideLayout = Platform.OS === 'web' || width >= 900;
 
   const selectedRoute = useMemo(
     () => routes.find((route) => route.id === selectedRouteId) ?? null,
@@ -32,34 +38,47 @@ export default function App() {
 
   useEffect(() => {
     void loadRoutes();
-  }, []);
+  }, [loadRoutes]);
 
   useEffect(() => {
     void saveRoutesToStorage(routes);
   }, [routes]);
 
-  async function loadRoutes() {
+  function mergeRoutes(primary: FitRoute[], secondary: FitRoute[]) {
+    const map = new Map<string, FitRoute>();
+    [...primary, ...secondary].forEach((route) => {
+      map.set(route.id, route);
+    });
+    return Array.from(map.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  const loadRoutes = useCallback(async () => {
+    const cached = await loadRoutesFromStorage();
+    if (cached.length > 0) {
+      setRoutes(cached);
+      setStatusMessage('Loaded routes from local storage.');
+    }
+
     try {
       setLoading(true);
       const data = await fetchRoutes();
-      setRoutes(data);
+      setRoutes((previous) => mergeRoutes(data, previous));
+      setStatusMessage(null);
     } catch {
-      const cached = await loadRoutesFromStorage();
       if (cached.length > 0) {
-        setRoutes(cached);
-        Alert.alert('Tryb offline', 'Załadowano trasy z pamięci urządzenia.');
+        setStatusMessage('Offline mode: loaded routes from local storage.');
       } else {
-        Alert.alert('Błąd', 'Nie udało się pobrać tras z API i brak danych lokalnych.');
+        setStatusMessage('API is unavailable and there are no local routes yet.');
       }
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   async function addCurrentLocationPoint() {
     const { status } = await Location.requestForegroundPermissionsAsync();
     if (status !== 'granted') {
-      Alert.alert('Brak uprawnień', 'Aby dodać punkt trasy, zezwól na GPS.');
+      Alert.alert('Permission required', 'Allow GPS access to add route points.');
       return;
     }
 
@@ -72,12 +91,13 @@ export default function App() {
     };
 
     setPoints((previous) => [...previous, point]);
+    setStatusMessage(null);
   }
 
   async function pickPhoto() {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
-      Alert.alert('Brak uprawnień', 'Aby dodać zdjęcie, zezwól na dostęp do galerii.');
+      Alert.alert('Permission required', 'Allow gallery access to add a photo.');
       return;
     }
 
@@ -99,27 +119,49 @@ export default function App() {
   }
 
   async function saveRoute() {
+    setStatusMessage(null);
+
     if (!name.trim()) {
-      Alert.alert('Walidacja', 'Nazwa trasy jest wymagana.');
+      setStatusMessage('Validation: route name is required.');
       return;
     }
 
     if (points.length < 2) {
-      Alert.alert('Walidacja', 'Dodaj minimum 2 punkty GPS.');
+      setStatusMessage('Validation: add at least 2 GPS points.');
       return;
     }
 
     try {
       if (selectedRouteId) {
-        const updated = await updateRoute(selectedRouteId, { name, points, photoUri });
+        const updated = await updateRoute(selectedRouteId, { name: name.trim(), points, photoUri });
         setRoutes((previous) => previous.map((route) => (route.id === selectedRouteId ? updated : route)));
+        setStatusMessage('Route updated successfully.');
       } else {
-        const created = await createRoute({ name, points, photoUri });
+        const created = await createRoute({ name: name.trim(), points, photoUri });
         setRoutes((previous) => [created, ...previous]);
+        setStatusMessage('Route created successfully.');
       }
       clearForm();
     } catch {
-      Alert.alert('Błąd', 'Nie udało się zapisać trasy.');
+      if (selectedRouteId) {
+        setRoutes((previous) =>
+          previous.map((route) =>
+            route.id === selectedRouteId ? { ...route, name: name.trim(), points, photoUri } : route
+          )
+        );
+        setStatusMessage('API unavailable: route updated locally.');
+      } else {
+        const localRoute: FitRoute = {
+          id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          name: name.trim(),
+          points,
+          photoUri,
+          createdAt: new Date().toISOString()
+        };
+        setRoutes((previous) => [localRoute, ...previous]);
+        setStatusMessage('API unavailable: route created locally.');
+      }
+      clearForm();
     }
   }
 
@@ -128,6 +170,7 @@ export default function App() {
     setName(route.name);
     setPoints(route.points);
     setPhotoUri(route.photoUri);
+    setStatusMessage(null);
   }
 
   async function removeRoute(id: string) {
@@ -137,8 +180,13 @@ export default function App() {
       if (selectedRouteId === id) {
         clearForm();
       }
+      setStatusMessage('Route deleted.');
     } catch {
-      Alert.alert('Błąd', 'Nie udało się usunąć trasy.');
+      setRoutes((previous) => previous.filter((route) => route.id !== id));
+      if (selectedRouteId === id) {
+        clearForm();
+      }
+      setStatusMessage('API unavailable: route deleted locally.');
     }
   }
 
@@ -148,81 +196,78 @@ export default function App() {
     <SafeAreaView style={styles.container}>
       <ScrollView contentContainerStyle={styles.content}>
         <Text style={styles.title}>FitRoute</Text>
-        <Text style={styles.subtitle}>CRUD tras spacerowych i rowerowych</Text>
+        <Text style={styles.subtitle}>CRUD for walking and cycling routes</Text>
+        {statusMessage ? <Text style={styles.status}>{statusMessage}</Text> : null}
 
         <View style={styles.formCard}>
-          <Text style={styles.label}>Nazwa trasy</Text>
+          <Text style={styles.label}>Route name</Text>
           <TextInput
             testID="route-name-input"
             value={name}
             onChangeText={setName}
-            placeholder="Np. Bulwary nad Wisłą"
+            placeholder="Example: Riverside loop"
             style={styles.input}
           />
 
           <View style={styles.rowButtons}>
             <TouchableOpacity style={styles.secondaryButton} onPress={addCurrentLocationPoint}>
-              <Text style={styles.buttonText}>Dodaj punkt GPS</Text>
+              <Text style={styles.buttonText}>Add GPS point</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.secondaryButton} onPress={pickPhoto}>
-              <Text style={styles.buttonText}>Dodaj zdjęcie</Text>
+              <Text style={styles.buttonText}>Add photo</Text>
             </TouchableOpacity>
           </View>
 
-          <Text style={styles.helper}>Punkty trasy: {points.length}</Text>
+          <Text style={styles.helper}>Route points: {points.length}</Text>
           {photoUri ? <Image source={{ uri: photoUri }} style={styles.photoPreview} /> : null}
 
           <View style={styles.rowButtons}>
             <TouchableOpacity testID="save-route-button" style={styles.primaryButton} onPress={saveRoute}>
-              <Text style={styles.buttonText}>{selectedRouteId ? 'Zapisz zmiany' : 'Utwórz trasę'}</Text>
+              <Text style={styles.buttonText}>{selectedRouteId ? 'Save changes' : 'Create route'}</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.cancelButton} onPress={clearForm}>
-              <Text style={styles.buttonText}>Wyczyść</Text>
+              <Text style={styles.buttonText}>Clear</Text>
             </TouchableOpacity>
           </View>
         </View>
 
-        <MapView
-          style={styles.map}
-          initialRegion={{
-            latitude: mapPoints[0]?.latitude ?? 52.2297,
-            longitude: mapPoints[0]?.longitude ?? 21.0122,
-            latitudeDelta: 0.08,
-            longitudeDelta: 0.08
-          }}
-        >
-          {mapPoints.map((point) => (
-            <Marker
-              key={`${point.latitude}-${point.longitude}-${point.timestamp}`}
-              coordinate={{ latitude: point.latitude, longitude: point.longitude }}
-            />
-          ))}
-          {mapPoints.length > 1 ? (
-            <Polyline
-              coordinates={mapPoints.map((point) => ({ latitude: point.latitude, longitude: point.longitude }))}
-              strokeWidth={4}
-              strokeColor="#1f6feb"
-            />
-          ) : null}
-        </MapView>
+        <View style={[styles.mapPointsContainer, isWideLayout ? styles.mapPointsRow : styles.mapPointsColumn]}>
+          <RouteMap points={mapPoints} style={[styles.map, isWideLayout ? styles.mapHalf : null]} />
+
+          <View style={[styles.pointsCard, isWideLayout ? styles.pointsHalf : null]}>
+            <Text style={styles.sectionTitle}>Points list</Text>
+            <ScrollView style={styles.pointsScroll} contentContainerStyle={styles.pointsScrollContent}>
+              {mapPoints.length === 0 ? <Text style={styles.routeMeta}>No points yet.</Text> : null}
+              {mapPoints.map((point, index) => (
+                <View key={`${point.timestamp}-${index}`} style={styles.pointRow}>
+                  <Text style={styles.pointTitle}>Point {index + 1}</Text>
+                  <Text style={styles.routeMeta}>
+                    lat: {point.latitude.toFixed(5)} | lon: {point.longitude.toFixed(5)}
+                  </Text>
+                  <Text style={styles.routeMeta}>{new Date(point.timestamp).toLocaleString()}</Text>
+                </View>
+              ))}
+            </ScrollView>
+          </View>
+        </View>
 
         <View style={styles.listCard}>
-          <Text style={styles.sectionTitle}>Twoje trasy</Text>
-          {loading ? <Text>Ładowanie...</Text> : null}
-          {!loading && routes.length === 0 ? <Text>Brak tras. Dodaj pierwszą trasę.</Text> : null}
+          <Text style={styles.sectionTitle}>Your routes</Text>
+          {loading ? <Text>Loading...</Text> : null}
+          {!loading && routes.length === 0 ? <Text>No routes yet. Create your first route.</Text> : null}
 
           {routes.map((route) => (
             <View key={route.id} style={styles.routeRow}>
               <View style={styles.routeInfo}>
                 <Text style={styles.routeName}>{route.name}</Text>
-                <Text style={styles.routeMeta}>Punkty: {route.points.length}</Text>
+                <Text style={styles.routeMeta}>Points: {route.points.length}</Text>
               </View>
               <View style={styles.rowButtons}>
                 <TouchableOpacity style={styles.smallButton} onPress={() => editRoute(route)}>
-                  <Text style={styles.buttonText}>Edytuj</Text>
+                  <Text style={styles.buttonText}>Edit</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.smallDangerButton} onPress={() => removeRoute(route.id)}>
-                  <Text style={styles.buttonText}>Usuń</Text>
+                  <Text style={styles.buttonText}>Delete</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -238,6 +283,7 @@ const styles = StyleSheet.create({
   content: { padding: 16, gap: 14 },
   title: { fontSize: 30, fontWeight: '700', color: '#14213d' },
   subtitle: { color: '#33415c' },
+  status: { color: '#0b7285', fontWeight: '600' },
   formCard: { backgroundColor: '#fff', borderRadius: 10, padding: 12, gap: 10 },
   label: { fontWeight: '600' },
   input: { borderWidth: 1, borderColor: '#d8dee9', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8 },
@@ -248,7 +294,17 @@ const styles = StyleSheet.create({
   secondaryButton: { flex: 1, backgroundColor: '#3182ce', padding: 10, borderRadius: 8, alignItems: 'center' },
   cancelButton: { backgroundColor: '#6c757d', padding: 10, borderRadius: 8, alignItems: 'center' },
   buttonText: { color: '#fff', fontWeight: '600' },
+  mapPointsContainer: { gap: 10 },
+  mapPointsRow: { flexDirection: 'row' },
+  mapPointsColumn: { flexDirection: 'column' },
   map: { width: '100%', height: 260, borderRadius: 10 },
+  mapHalf: { flex: 1, width: undefined },
+  pointsCard: { backgroundColor: '#fff', borderRadius: 10, padding: 12, gap: 8, minHeight: 260 },
+  pointsHalf: { flex: 1 },
+  pointsScroll: { maxHeight: 220 },
+  pointsScrollContent: { gap: 8, paddingBottom: 6 },
+  pointRow: { borderWidth: 1, borderColor: '#e5e9f0', borderRadius: 8, padding: 8, gap: 4 },
+  pointTitle: { fontWeight: '700', color: '#1b263b' },
   listCard: { backgroundColor: '#fff', borderRadius: 10, padding: 12, gap: 8 },
   sectionTitle: { fontWeight: '700', fontSize: 16 },
   routeRow: {
