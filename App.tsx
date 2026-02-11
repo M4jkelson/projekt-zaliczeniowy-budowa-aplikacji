@@ -36,14 +36,6 @@ export default function App() {
     [routes, selectedRouteId]
   );
 
-  useEffect(() => {
-    void loadRoutes();
-  }, [loadRoutes]);
-
-  useEffect(() => {
-    void saveRoutesToStorage(routes);
-  }, [routes]);
-
   function mergeRoutes(primary: FitRoute[], secondary: FitRoute[]) {
     const map = new Map<string, FitRoute>();
     [...primary, ...secondary].forEach((route) => {
@@ -74,6 +66,14 @@ export default function App() {
       setLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    void loadRoutes();
+  }, [loadRoutes]);
+
+  useEffect(() => {
+    void saveRoutesToStorage(routes);
+  }, [routes]);
 
   async function addCurrentLocationPoint() {
     const { status } = await Location.requestForegroundPermissionsAsync();
